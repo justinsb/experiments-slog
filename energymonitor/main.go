@@ -12,9 +12,13 @@ import (
 	"os/signal"
 	"time"
 
+	"github.com/justinsb/experiments-slog/energymonitor/attrs"
+	"github.com/justinsb/experiments-slog/energymonitor/kslog"
+
+	"golang.org/x/exp/slog"
+
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
-	"k8s.io/klog/v2"
 
 	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 	"go.opentelemetry.io/otel"
@@ -30,12 +34,16 @@ import (
 	"go.opentelemetry.io/otel/trace"
 )
 
-var tracer = otel.Tracer("energymonitor")
+var tracer = kslog.Tracer("energymonitor")
 
 // Initializes an OTLP exporter, and configures the corresponding trace and
 // metric providers.
 func initProvider(otelEndpoint string) (func(), error) {
 	ctx := context.Background()
+
+	log := slog.FromContext(ctx)
+
+	log.Info("configuring opentelemetry", slog.String("otel.endpoint", otelEndpoint))
 
 	res, err := resource.New(ctx,
 		resource.WithAttributes(
@@ -84,10 +92,10 @@ func initProvider(otelEndpoint string) (func(), error) {
 
 	return func() {
 		if err := meterProvider.Shutdown(context.Background()); err != nil {
-			klog.Warningf("failed to shutdown opentelemetry metric provider: %v", err)
+			log.Error("failed to shutdown opentelemetry metric provider", err)
 		}
 		if err := tracerProvider.Shutdown(context.Background()); err != nil {
-			klog.Warningf("failed to shutdown opentelemetry tracer provider: %v", err)
+			log.Error("failed to shutdown opentelemetry tracer provider", err)
 		}
 	}, nil
 }
@@ -112,7 +120,7 @@ func installHooks() error {
 }
 
 func run(ctx context.Context) error {
-	klog.InitFlags(nil)
+	kslog.InitFlags(nil)
 	flag.Parse()
 
 	shutdown, err := initProvider(os.Getenv("OTEL_ENDPOINT"))
@@ -137,7 +145,7 @@ func run(ctx context.Context) error {
 
 func readMeterForever(ctx context.Context, reader *MeterReader) error {
 	interval := 1 * time.Minute
-	ticker := time.NewTicker(interval)
+	ticker := time.NewTicker(time.Second)
 	defer ticker.Stop()
 
 	for {
@@ -145,8 +153,9 @@ func readMeterForever(ctx context.Context, reader *MeterReader) error {
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-ticker.C:
+			ticker.Reset(interval)
 			if err := readMeterOnce(ctx, reader); err != nil {
-				klog.Warningf("error reading meter: %v", err)
+				slog.Error("error reading meter", err)
 			}
 		}
 	}
@@ -155,7 +164,7 @@ func readMeterForever(ctx context.Context, reader *MeterReader) error {
 func readMeterOnce(ctx context.Context, reader *MeterReader) error {
 	readerID := "todo"
 
-	ctx, span := tracer.Start(ctx, "MeterReader-Read", trace.WithAttributes(attribute.String("reader", readerID)))
+	ctx, span, _ := tracer.Start(ctx, "MeterReader-Read", trace.WithAttributes(attribute.String("reader", readerID)))
 	defer span.End()
 
 	if err := reader.ReadProduction(ctx); err != nil {
@@ -176,7 +185,7 @@ type Measurement struct {
 
 	ActiveCount       int     `json:"activeCount"`
 	ReadingTime       int64   `json:"readingTime"`
-	WattsNow          float32 `json:"wNow"`
+	WattsNow          float64 `json:"wNow"`
 	WattHoursLifetime float64 `json:"whLifetime"`
 }
 
@@ -196,13 +205,13 @@ func NewMeterReader() (*MeterReader, error) {
 func (r *MeterReader) ReadProduction(ctx context.Context) error {
 	httpClient := http.DefaultClient
 
-	ctx, span := tracer.Start(ctx, "ReadProduction")
+	ctx, span, log := tracer.Start(ctx, "ReadProduction")
 	defer span.End()
 
 	u := r.baseURL.JoinPath("production.json")
 	u.RawQuery = "details=1"
 	productionURL := u.String()
-	klog.Infof("doing GET %v", productionURL)
+	log.Info("doing http request", attrs.HTTPMethod("GET"), attrs.HTTPURL(productionURL))
 	t := time.Now()
 	request, err := http.NewRequestWithContext(ctx, "GET", productionURL, nil)
 	if err != nil {
@@ -225,7 +234,7 @@ func (r *MeterReader) ReadProduction(ctx context.Context) error {
 		return fmt.Errorf("error parsing %q data: %w", productionURL, err)
 	}
 
-	klog.Infof("response: %#v", info)
+	log.Debug("http response", slog.String("body", string(b)))
 
 	for _, m := range info.Production {
 		if m.Type != "eim" {
@@ -234,12 +243,12 @@ func (r *MeterReader) ReadProduction(ctx context.Context) error {
 		if m.MeasurementType != "production" {
 			continue
 		}
-		klog.Infof("production at %v is %v", t, m.WattsNow)
+		log.Info("read production", slog.Int64("time", t.UnixNano()), slog.Float64("watts", m.WattsNow))
 
-		productionSync.Record(ctx, float64(m.WattsNow))
-		production.Observe(ctx, float64(m.WattsNow))
+		productionSync.Record(ctx, m.WattsNow)
+		production.Observe(ctx, m.WattsNow)
 
-		span.AddEvent("observed production", trace.WithAttributes(attribute.Float64("value", float64(m.WattsNow))))
+		span.AddEvent("observed production", trace.WithAttributes(attribute.Float64("value", m.WattsNow)))
 	}
 
 	for _, m := range info.Consumption {
@@ -249,10 +258,10 @@ func (r *MeterReader) ReadProduction(ctx context.Context) error {
 		if m.MeasurementType != "total-consumption" {
 			continue
 		}
-		klog.Infof("consumption at %v is %v", t, m.WattsNow)
-		consumptionSync.Record(ctx, float64(m.WattsNow))
-		consumption.Observe(ctx, float64(m.WattsNow))
-		span.AddEvent("observed consumption", trace.WithAttributes(attribute.Float64("value", float64(m.WattsNow))))
+		log.Info("read consumption", slog.Int64("time", t.UnixNano()), slog.Float64("watts", m.WattsNow))
+		consumptionSync.Record(ctx, m.WattsNow)
+		consumption.Observe(ctx, m.WattsNow)
+		span.AddEvent("observed consumption", trace.WithAttributes(attribute.Float64("value", m.WattsNow)))
 	}
 
 	return nil
